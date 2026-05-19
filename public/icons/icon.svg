@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="96" fill="#EFE3C2"/>
+
+  <!-- Topographic line pattern -->
+  <g stroke="#A8471A" fill="none" stroke-width="2" opacity="0.25">
+    <path d="M 0 200 Q 128 140 256 200 T 512 200"/>
+    <path d="M 0 240 Q 128 180 256 240 T 512 240"/>
+    <path d="M 0 280 Q 128 220 256 280 T 512 280"/>
+    <path d="M 0 320 Q 128 260 256 320 T 512 320"/>
+    <path d="M 0 160 Q 128 100 256 160 T 512 160"/>
+    <path d="M 0 360 Q 128 300 256 360 T 512 360"/>
+  </g>
+
+  <!-- FM monogram with editorial weight, centred -->
+  <g fill="#1C1813" font-family="'Fraunces', Georgia, serif" font-weight="700">
+    <!-- F+M combined letterform — drawn as paths for fidelity at all sizes -->
+    <text x="256" y="320" text-anchor="middle" font-size="240" letter-spacing="-12">FM</text>
+  </g>
+
+  <!-- Small "no.01" inscription -->
+  <text x="256" y="400" text-anchor="middle" fill="#A8471A" font-family="'JetBrains Mono', monospace" font-size="32" letter-spacing="6">NO. 01</text>
+
+  <!-- Tiny rust accent dot -->
+  <circle cx="256" cy="120" r="10" fill="#A8471A"/>
+</svg>

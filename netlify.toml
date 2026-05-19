@@ -1,0 +1,15 @@
+[build]
+command = "npm run build"
+publish = ".next"
+
+[functions]
+node_bundler = "esbuild"
+
+[[redirects]]
+from = "/*"
+to = "/index.html"
+status = 200
+
+[context.production.environment]
+# Set your ANTHROPIC_API_KEY in Netlify's environment variables UI
+# Go to Site settings → Build & deploy → Environment
