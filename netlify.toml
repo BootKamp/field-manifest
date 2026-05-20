@@ -5,6 +5,9 @@ publish = ".next"
 [functions]
 node_bundler = "esbuild"
 
+[functions."plan-route"]
+timeout = 30
+
 [[redirects]]
 from = "/*"
 to = "/index.html"
