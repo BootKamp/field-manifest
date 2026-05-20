@@ -2786,6 +2786,7 @@ const LOADING_PHRASES = [
 // Robust JSON extraction — Claude sometimes wraps in markdown despite instructions.
 function extractJson(text) {
   let s = (text || '').replace(/```(?:json|JSON)?\s*/g, '').replace(/```\s*$/g, '').trim();
+  s = s.replace(/^\s*\]\s*/, '').replace(/\s*\[\s*$/, '').trim();
   const start = s.indexOf('{');
   const end = s.lastIndexOf('}');
   if (start === -1 || end === -1) throw new Error('No JSON in response');
@@ -2963,7 +2964,7 @@ Sort stops ascending by distFromStartKm. Keep notes ≤80 chars. Keep advice to 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 1000,
+        max_tokens: 2000,
         messages: [{ role: 'user', content: buildPrompt(s, e) }],
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       }),
