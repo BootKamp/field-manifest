@@ -2940,7 +2940,7 @@ Sort stops ascending by distFromStartKm. Keep notes ≤80 chars. Keep advice to 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 1000,
         messages: [{ role: 'user', content: buildPrompt(s, e) }],
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
