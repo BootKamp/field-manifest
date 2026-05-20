@@ -1,12 +1,13 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Check, ChevronDown, Plus, X, Search, Download, Copy, Mail,
   Droplet, Tent, Flame, Utensils, Wrench, Heart, Sparkles,
   Shirt, Baby, Truck, Radio, RotateCcw, Trash2, FileText, Send,
   Apple, Refrigerator, Lightbulb, Compass, ListChecks, Sandwich,
   ShowerHead, Footprints, ClipboardCheck, Sun, MapPin, Users, Beer, Wine,
-  Fuel, AlertTriangle, ArrowRight
+  Fuel, AlertTriangle, ArrowRight, UserCheck, RefreshCw
 } from 'lucide-react';
+import { supabase, generateTripCode } from '../lib/supabase';
 
 /* ---------------------------------------------------------------
    THE FIELD MANIFEST
@@ -1219,6 +1220,7 @@ export default function FieldManifest() {
   const [tripName, setTripName] = useState('Current trip');
   const [fuelEntries, setFuelEntries] = useState([]);     // [{id, date, location, odo, litres, pricePerL, totalCost}]
   const [journalEntries, setJournalEntries] = useState([]); // [{id, date, location, kmTravelled, lat, lng, reflection, weather}]
+  const [crewTrip, setCrewTrip] = useState(null);         // {id, name} — active shared trip
   const loaded = useRef(false);
 
   // Load persisted state once
@@ -1236,6 +1238,7 @@ export default function FieldManifest() {
         if (s.tripName) setTripName(s.tripName);
         if (Array.isArray(s.fuelEntries)) setFuelEntries(s.fuelEntries);
         if (Array.isArray(s.journalEntries)) setJournalEntries(s.journalEntries);
+        if (s.crewTrip) setCrewTrip(s.crewTrip);
       } else {
         // first run — open the first three categories
         setOpen({ admin: true, water: true, pantry: true });
@@ -1251,9 +1254,9 @@ export default function FieldManifest() {
       config, checked, hidden, custom, open,
       email: emailSaved ? email : '',
       tab, tripName,
-      fuelEntries, journalEntries,
+      fuelEntries, journalEntries, crewTrip,
     });
-  }, [config, checked, hidden, custom, open, email, emailSaved, tab, tripName, journalEntries]);
+  }, [config, checked, hidden, custom, open, email, emailSaved, tab, tripName, journalEntries, crewTrip]);
 
   // Toast helper
   const flash = (msg) => { setToast(msg); setTimeout(() => setToast(''), 1800); };
@@ -1416,7 +1419,7 @@ export default function FieldManifest() {
         </header>
 
         {/* ============= TAB BAR ============= */}
-        <TabBar tab={tab} setTab={setTab} journalCount={journalEntries.length}/>
+        <TabBar tab={tab} setTab={setTab} journalCount={journalEntries.length} hasCrewTrip={!!crewTrip}/>
 
         {tab === 'pack' && (<>
 
@@ -1610,6 +1613,15 @@ export default function FieldManifest() {
             setEntries={setJournalEntries}
             flash={flash}
             config={config}
+          />
+        )}
+
+        {tab === 'crew' && (
+          <CrewView
+            categories={visible}
+            crewTrip={crewTrip}
+            setCrewTrip={(t) => { setCrewTrip(t); }}
+            flash={flash}
           />
         )}
       </div>
@@ -2136,14 +2148,15 @@ function BPList({ label, kicker, tint, items, bullet }) {
 //  TAB BAR
 //  Pack ↔ Journal switcher. Sits under the masthead and persists.
 // =====================================================================
-function TabBar({ tab, setTab, journalCount }) {
+function TabBar({ tab, setTab, journalCount, hasCrewTrip }) {
   const tabs = [
-    { id: 'pack',    label: 'Pack',    icon: ListChecks, hint: 'before you leave' },
-    { id: 'journal', label: 'Journal', icon: FileText,   hint: 'on the road' },
+    { id: 'pack',    label: 'Pack',      icon: ListChecks, hint: 'before you leave' },
+    { id: 'journal', label: 'Fuel',      icon: FileText,   hint: 'on the road' },
+    { id: 'crew',    label: 'TripShare', icon: Users,      hint: 'shared list' },
   ];
   return (
     <div style={{
-      display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6,
+      display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6,
       background: C.paper, border: `1px solid ${C.rule}`,
       borderRadius: 12, padding: 4, marginBottom: 18,
     }}>
@@ -2169,6 +2182,15 @@ function TabBar({ tab, setTab, journalCount }) {
                 fontWeight: 600, letterSpacing: 0.5,
               }}>
                 {journalCount}
+              </span>
+            )}
+            {t.id === 'crew' && hasCrewTrip && (
+              <span className="mono" style={{
+                fontSize: 10, padding: '2px 6px', borderRadius: 999,
+                background: active ? C.rust : C.rust, color: C.bg,
+                fontWeight: 600, letterSpacing: 0.5,
+              }}>
+                live
               </span>
             )}
           </button>
@@ -3933,5 +3955,381 @@ function IconBtn({ children, onClick, title }) {
       }}>
       {children}
     </button>
+  );
+}
+
+// =====================================================================
+//  CREW VIEW — shared packing list via Supabase realtime
+//  Added on top of v1 — everything else in this file is unchanged.
+// =====================================================================
+function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
+  const [myName, setMyName] = useState(() => {
+    try { return localStorage.getItem('fm_crew_name') || ''; } catch { return ''; }
+  });
+  const [nameInput, setNameInput]     = useState('');
+  const [tripInput, setTripInput]     = useState('');
+  const [newTripName, setNewTripName] = useState('');
+  const [claims, setClaims]           = useState([]);
+  const [loading, setLoading]         = useState(false);
+  const [syncing, setSyncing]         = useState(false);
+  const [view, setView]               = useState(crewTrip ? 'active' : 'lobby');
+  const subRef = useRef(null);
+
+  const saveName = (name) => {
+    setMyName(name);
+    try { localStorage.setItem('fm_crew_name', name); } catch {}
+  };
+
+  const fetchClaims = useCallback(async (tripId) => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from('claims').select('*').eq('trip_id', tripId);
+    if (!error && data) setClaims(data);
+  }, []);
+
+  const subscribe = useCallback((tripId) => {
+    if (!supabase) return;
+    if (subRef.current) subRef.current.unsubscribe();
+    subRef.current = supabase
+      .channel(`claims:${tripId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'claims', filter: `trip_id=eq.${tripId}` },
+        () => fetchClaims(tripId))
+      .subscribe();
+  }, [fetchClaims]);
+
+  // On mount: reconnect to existing trip if we have one
+  useEffect(() => {
+    if (crewTrip) {
+      setView('active');
+      fetchClaims(crewTrip.id);
+      subscribe(crewTrip.id);
+    }
+    return () => { if (subRef.current) subRef.current.unsubscribe(); };
+  }, []);
+
+  const createTrip = async () => {
+    if (!supabase) { flash('Supabase not configured — add env vars and redeploy.'); return; }
+    const name = (myName || nameInput).trim();
+    if (!name) { flash('Enter your name first'); return; }
+    if (!newTripName.trim()) { flash('Give the trip a name'); return; }
+    saveName(name);
+    setLoading(true);
+    const code = generateTripCode();
+    const { error } = await supabase.from('trips').insert({ id: code, name: newTripName.trim() });
+    if (error) { flash('Could not create trip — try again'); setLoading(false); return; }
+    const trip = { id: code, name: newTripName.trim() };
+    setCrewTrip(trip);
+    subscribe(code);
+    setClaims([]);
+    setView('active');
+    setLoading(false);
+    flash(`Trip created — share the code: ${code}`);
+  };
+
+  const joinTrip = async () => {
+    if (!supabase) { flash('Supabase not configured — add env vars and redeploy.'); return; }
+    const name = (myName || nameInput).trim();
+    if (!name) { flash('Enter your name first'); return; }
+    const code = tripInput.trim().toUpperCase();
+    if (code.length !== 6) { flash('Enter the 6-character trip code'); return; }
+    saveName(name);
+    setLoading(true);
+    const { data, error } = await supabase.from('trips').select('*').eq('id', code).single();
+    if (error || !data) { flash(`No trip found with code ${code}`); setLoading(false); return; }
+    setCrewTrip(data);
+    await fetchClaims(code);
+    subscribe(code);
+    setView('active');
+    setLoading(false);
+    flash(`Joined: ${data.name}`);
+  };
+
+  const claimItem = async (itemId, itemName, category) => {
+    if (!supabase || !crewTrip) return;
+    setSyncing(true);
+    const name = myName.trim();
+    const existing = claims.find(c => c.item_id === itemId);
+    if (existing) {
+      await supabase.from('claims').update({ claimed_by: name, claimed_at: new Date().toISOString() }).eq('id', existing.id);
+    } else {
+      await supabase.from('claims').insert({ trip_id: crewTrip.id, item_id: itemId, item_name: itemName, category, claimed_by: name });
+    }
+    await fetchClaims(crewTrip.id);
+    setSyncing(false);
+  };
+
+  const releaseClaim = async (itemId) => {
+    if (!supabase || !crewTrip) return;
+    setSyncing(true);
+    const existing = claims.find(c => c.item_id === itemId);
+    if (existing) await supabase.from('claims').delete().eq('id', existing.id);
+    await fetchClaims(crewTrip.id);
+    setSyncing(false);
+  };
+
+  const leaveTrip = () => {
+    if (subRef.current) subRef.current.unsubscribe();
+    setCrewTrip(null);
+    setClaims([]);
+    setView('lobby');
+    flash('Left the trip');
+  };
+
+  const copyCode = () => {
+    navigator.clipboard.writeText(crewTrip.id).catch(() => {});
+    flash('Code copied!');
+  };
+
+  // Flat list of all visible items with category info
+  const allItems = useMemo(() => {
+    const rows = [];
+    for (const cat of categories) {
+      const items = [...cat.items, ...(cat.extraItems || [])];
+      for (const item of items) rows.push({ id: item.id, name: item.name, category: cat.title, tint: cat.tint });
+    }
+    return rows;
+  }, [categories]);
+
+  const claimMap = useMemo(() => {
+    const m = {};
+    for (const c of claims) m[c.item_id] = c.claimed_by;
+    return m;
+  }, [claims]);
+
+  const groupedItems = useMemo(() => {
+    const groups = {};
+    for (const item of allItems) {
+      if (!groups[item.category]) groups[item.category] = { title: item.category, tint: item.tint, items: [] };
+      groups[item.category].items.push({ ...item, claimer: claimMap[item.id] || null });
+    }
+    return Object.values(groups);
+  }, [allItems, claimMap]);
+
+  // Deterministic colour per person name
+  const personColor = (name) => {
+    const hue = [...name].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+    return `hsl(${hue},50%,32%)`;
+  };
+  const personBg = (name) => {
+    const hue = [...name].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+    return `hsl(${hue},40%,92%)`;
+  };
+
+  // ── LOBBY ──────────────────────────────────────────────────────────
+  if (view === 'lobby' || !crewTrip) {
+    return (
+      <div className="grow-in">
+
+        {/* Hero card */}
+        <section style={{ background: C.ink, color: C.bg, borderRadius: 14, marginBottom: 14, overflow: 'hidden', position: 'relative' }}>
+          <svg aria-hidden="true" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0.07, pointerEvents: 'none' }}>
+            <defs>
+              <pattern id="topo-crew-lobby" x="0" y="0" width="220" height="220" patternUnits="userSpaceOnUse">
+                <path d="M 0 110 Q 55 60 110 110 T 220 110" fill="none" stroke={C.bg} strokeWidth="0.8"/>
+                <path d="M 0 140 Q 55 95 110 140 T 220 140" fill="none" stroke={C.bg} strokeWidth="0.6"/>
+                <path d="M 0 80 Q 55 30 110 80 T 220 80" fill="none" stroke={C.bg} strokeWidth="0.5"/>
+              </pattern>
+            </defs>
+            <rect width="100%" height="100%" fill="url(#topo-crew-lobby)"/>
+          </svg>
+          <div style={{ position: 'relative', padding: 18 }}>
+            <div className="mono" style={{ fontSize: 11, letterSpacing: 2, opacity: 0.6, textTransform: 'uppercase' }}>Crew sync</div>
+            <div className="fr" style={{ fontSize: 26, fontWeight: 600, lineHeight: 1.15, marginTop: 4 }}>
+              Share the load.<br/>Don't bring two tents.
+            </div>
+            <p className="fr" style={{ fontStyle: 'italic', fontSize: 13, opacity: 0.8, marginTop: 8, lineHeight: 1.5, margin: '8px 0 0' }}>
+              Create a trip and share the code. Everyone claims what they're bringing — live.
+            </p>
+          </div>
+        </section>
+
+        {/* Name */}
+        <section style={{ background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 14, padding: 16, marginBottom: 12 }}>
+          <Label>Your name</Label>
+          <input
+            value={myName || nameInput}
+            onChange={e => { setNameInput(e.target.value); setMyName(e.target.value); }}
+            placeholder="e.g. Vaughan"
+            style={{ width: '100%', marginTop: 6, padding: '9px 12px', border: `1px solid ${C.rule}`, borderRadius: 9, fontFamily: "'Fraunces', serif", fontSize: 16, background: C.bg, color: C.ink, outline: 'none' }}
+          />
+        </section>
+
+        {/* Create */}
+        <section style={{ background: C.paper, border: `1px solid ${C.rule}`, borderLeft: `4px solid ${C.forest}`, borderRadius: 14, padding: 16, marginBottom: 12 }}>
+          <div className="mono" style={{ fontSize: 9, letterSpacing: 2, textTransform: 'uppercase', color: C.forest, marginBottom: 10 }}>Create a new shared trip</div>
+          <Label>Trip name</Label>
+          <input
+            value={newTripName}
+            onChange={e => setNewTripName(e.target.value)}
+            placeholder="e.g. Simpson Desert 2025"
+            style={{ width: '100%', margin: '4px 0 12px', padding: '9px 12px', border: `1px solid ${C.rule}`, borderRadius: 9, fontFamily: 'inherit', fontSize: 14, background: C.bg, color: C.ink, outline: 'none' }}
+          />
+          <button onClick={createTrip} disabled={loading} className="lift"
+            style={{ width: '100%', padding: 12, background: C.forest, color: C.bg, border: 'none', borderRadius: 10, fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 14, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+            <Plus size={15}/>{loading ? 'Creating…' : 'Create trip & get code'}
+          </button>
+        </section>
+
+        {/* Join */}
+        <section style={{ background: C.paper, border: `1px solid ${C.rule}`, borderLeft: `4px solid ${C.rust}`, borderRadius: 14, padding: 16 }}>
+          <div className="mono" style={{ fontSize: 9, letterSpacing: 2, textTransform: 'uppercase', color: C.rust, marginBottom: 10 }}>Join an existing trip</div>
+          <Label>6-character trip code</Label>
+          <input
+            value={tripInput}
+            onChange={e => setTripInput(e.target.value.toUpperCase())}
+            placeholder="e.g. KBMPQR"
+            maxLength={6}
+            style={{ width: '100%', margin: '4px 0 12px', padding: '9px 12px', border: `1px solid ${C.rule}`, borderRadius: 9, fontFamily: "'JetBrains Mono', monospace", fontSize: 18, letterSpacing: 5, background: C.bg, color: C.ink, outline: 'none', textTransform: 'uppercase' }}
+          />
+          <button onClick={joinTrip} disabled={loading} className="lift"
+            style={{ width: '100%', padding: 12, background: C.rust, color: C.bg, border: 'none', borderRadius: 10, fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 14, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+            <ArrowRight size={15}/>{loading ? 'Joining…' : 'Join trip'}
+          </button>
+        </section>
+      </div>
+    );
+  }
+
+  // ── ACTIVE TRIP ────────────────────────────────────────────────────
+  const totalItems   = allItems.length;
+  const claimedCount = claims.length;
+  const myCount      = claims.filter(c => c.claimed_by === myName).length;
+  const uniquePeople = [...new Set(claims.map(c => c.claimed_by))];
+
+  return (
+    <div className="grow-in">
+
+      {/* Trip header */}
+      <section style={{ background: C.ink, color: C.bg, borderRadius: 14, marginBottom: 14, overflow: 'hidden', position: 'relative' }}>
+        <svg aria-hidden="true" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0.07, pointerEvents: 'none' }}>
+          <defs>
+            <pattern id="topo-crew-active" x="0" y="0" width="220" height="220" patternUnits="userSpaceOnUse">
+              <path d="M 0 110 Q 55 60 110 110 T 220 110" fill="none" stroke={C.bg} strokeWidth="0.8"/>
+              <path d="M 0 80 Q 55 30 110 80 T 220 80" fill="none" stroke={C.bg} strokeWidth="0.5"/>
+            </pattern>
+          </defs>
+          <rect width="100%" height="100%" fill="url(#topo-crew-active)"/>
+        </svg>
+        <div style={{ position: 'relative', padding: 18 }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
+            <div style={{ minWidth: 0 }}>
+              <div className="mono" style={{ fontSize: 10, letterSpacing: 2, opacity: 0.6, textTransform: 'uppercase' }}>Active crew trip</div>
+              <div className="fr" style={{ fontSize: 24, fontWeight: 600, lineHeight: 1.1, marginTop: 4 }}>{crewTrip.name}</div>
+            </div>
+            {/* Code chip — tap to copy */}
+            <button onClick={copyCode}
+              style={{ background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', borderRadius: 10, padding: '8px 12px', color: C.bg, cursor: 'pointer', flexShrink: 0, textAlign: 'center' }}>
+              <div className="mono" style={{ fontSize: 20, letterSpacing: 4, fontWeight: 600 }}>{crewTrip.id}</div>
+              <div className="mono" style={{ fontSize: 9, opacity: 0.55, letterSpacing: 1, textTransform: 'uppercase', marginTop: 2 }}>tap to copy</div>
+            </button>
+          </div>
+          {/* Stats row */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 14 }}>
+            {[['Items', totalItems], ['Claimed', claimedCount], ['Mine', myCount]].map(([label, val]) => (
+              <div key={label} style={{ background: 'rgba(255,255,255,0.06)', borderRadius: 10, padding: '10px 12px' }}>
+                <div className="mono" style={{ fontSize: 9, letterSpacing: 1.5, opacity: 0.6, textTransform: 'uppercase' }}>{label}</div>
+                <div className="fr" style={{ fontSize: 22, fontWeight: 600, marginTop: 3 }}>{val}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* Who I am + action bar */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14, alignItems: 'center' }}>
+        <div style={{ flex: 1, background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 10, padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <UserCheck size={14} color={C.muted}/>
+          <span className="mono" style={{ fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', color: C.muted }}>You:</span>
+          <span className="fr" style={{ fontSize: 15, fontWeight: 600, color: C.ink }}>{myName}</span>
+          {syncing && (
+            <span className="mono" style={{ fontSize: 10, color: C.muted, marginLeft: 'auto' }}>syncing…</span>
+          )}
+        </div>
+        <button onClick={() => fetchClaims(crewTrip.id)} title="Refresh" className="lift"
+          style={{ padding: '8px 10px', background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 10, cursor: 'pointer', color: C.muted, display: 'grid', placeItems: 'center' }}>
+          <RefreshCw size={15}/>
+        </button>
+        <button onClick={leaveTrip} title="Leave trip" className="lift"
+          style={{ padding: '8px 10px', background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 10, cursor: 'pointer', color: C.muted, display: 'grid', placeItems: 'center' }}>
+          <X size={15}/>
+        </button>
+      </div>
+
+      {/* Crew legend */}
+      {uniquePeople.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 14 }}>
+          {uniquePeople.map(p => (
+            <span key={p} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, background: personBg(p), color: personColor(p), borderRadius: 999, padding: '4px 10px', fontSize: 12, fontWeight: 600 }}>
+              {p} · {claims.filter(c => c.claimed_by === p).length} items
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Items grouped by category */}
+      {groupedItems.map(group => {
+        const t = tintFor(group.tint);
+        return (
+          <section key={group.title} style={{ background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 14, marginBottom: 10, overflow: 'hidden' }}>
+            {/* Category header */}
+            <div style={{ padding: '10px 14px', borderBottom: `1px solid ${C.rule}`, display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ width: 8, height: 8, borderRadius: '50%', background: t.icon, flexShrink: 0 }}/>
+              <span className="fr" style={{ fontWeight: 600, fontSize: 14, color: C.ink, flex: 1 }}>{group.title}</span>
+              <span className="mono" style={{ fontSize: 9, letterSpacing: 1, color: C.muted }}>
+                {group.items.filter(i => i.claimer).length}/{group.items.length}
+              </span>
+            </div>
+            {/* Items */}
+            {group.items.map((item, idx) => {
+              const isMine   = item.claimer === myName;
+              const isClaimed = !!item.claimer;
+              return (
+                <div key={item.id} style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '9px 14px',
+                  borderBottom: idx < group.items.length - 1 ? `1px solid ${C.rule}` : 'none',
+                  background: isMine ? `${C.forestLt}55` : 'transparent',
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13.5, color: C.ink, fontWeight: isMine ? 600 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {item.name}
+                    </div>
+                    {item.claimer && (
+                      <div style={{ marginTop: 3 }}>
+                        <span style={{ background: personBg(item.claimer), color: personColor(item.claimer), padding: '1px 8px', borderRadius: 999, fontSize: 11, fontWeight: 600 }}>
+                          {item.claimer}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  {isClaimed ? (
+                    <button onClick={() => isMine ? releaseClaim(item.id) : claimItem(item.id, item.name, group.title)}
+                      className="lift"
+                      style={{
+                        padding: '5px 11px', borderRadius: 8, fontSize: 12.5, fontWeight: 600, cursor: 'pointer', border: 'none', flexShrink: 0,
+                        background: isMine ? C.forest : C.rustLt,
+                        color: isMine ? C.bg : C.rustDk,
+                      }}>
+                      {isMine ? '✓ Mine' : 'Take it'}
+                    </button>
+                  ) : (
+                    <button onClick={() => claimItem(item.id, item.name, group.title)}
+                      className="lift"
+                      style={{ padding: '5px 11px', borderRadius: 8, fontSize: 12.5, fontWeight: 600, cursor: 'pointer', background: C.paper2, border: `1px solid ${C.rule}`, color: C.ink2, flexShrink: 0 }}>
+                      I'll bring it
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </section>
+        );
+      })}
+
+      <footer style={{ marginTop: 28, paddingTop: 18, borderTop: `1px solid ${C.rule}` }}>
+        <p className="fr" style={{ fontStyle: 'italic', color: C.muted, fontSize: 13.5, lineHeight: 1.5, margin: 0 }}>
+          Share the trip code with your crew. Everyone joins, taps what they're bringing. No duplicate tents.
+        </p>
+      </footer>
+    </div>
   );
 }
