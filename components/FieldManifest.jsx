@@ -2786,6 +2786,7 @@ const LOADING_PHRASES = [
 // Robust JSON extraction — Claude sometimes wraps in markdown despite instructions.
 function extractJson(text) {
   let s = (text || '').replace(/```(?:json|JSON)?\s*/g, '').replace(/```\s*$/g, '').trim();
+  // Strip any leading array bracket that can appear when tool_use blocks wrap the response
   s = s.replace(/^\s*\]\s*/, '').replace(/\s*\[\s*$/, '').trim();
   const start = s.indexOf('{');
   const end = s.lastIndexOf('}');
@@ -4085,7 +4086,7 @@ function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
     const rows = [];
     for (const cat of categories) {
       const items = [...cat.items, ...(cat.extraItems || [])];
-      for (const item of items) rows.push({ id: item.id, name: item.name, category: cat.title, tint: cat.tint });
+      for (const item of items) rows.push({ id: item.id, name: item.name, category: cat.title, tint: cat.tint, icon: cat.icon });
     }
     return rows;
   }, [categories]);
@@ -4099,11 +4100,23 @@ function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
   const groupedItems = useMemo(() => {
     const groups = {};
     for (const item of allItems) {
-      if (!groups[item.category]) groups[item.category] = { title: item.category, tint: item.tint, items: [] };
+      if (!groups[item.category]) groups[item.category] = { title: item.category, tint: item.tint, icon: item.icon, items: [] };
       groups[item.category].items.push({ ...item, claimer: claimMap[item.id] || null });
     }
     return Object.values(groups);
   }, [allItems, claimMap]);
+
+  const [crewOpen, setCrewOpen] = useState({});
+
+  const shareTrip = () => {
+    const msg = `Join my Field Manifest trip "${crewTrip.name}" — use code: ${crewTrip.id}`;
+    if (navigator.share) {
+      navigator.share({ title: 'Join my Field Manifest trip', text: msg }).catch(() => {});
+    } else {
+      navigator.clipboard.writeText(msg).catch(() => {});
+      flash('Invite copied — paste it into your group chat');
+    }
+  };
 
   // Deterministic colour per person name
   const personColor = (name) => {
@@ -4190,6 +4203,7 @@ function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
     );
   }
 
+
   // ── ACTIVE TRIP ────────────────────────────────────────────────────
   const totalItems   = allItems.length;
   const claimedCount = claims.length;
@@ -4216,14 +4230,12 @@ function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
               <div className="mono" style={{ fontSize: 10, letterSpacing: 2, opacity: 0.6, textTransform: 'uppercase' }}>Active crew trip</div>
               <div className="fr" style={{ fontSize: 24, fontWeight: 600, lineHeight: 1.1, marginTop: 4 }}>{crewTrip.name}</div>
             </div>
-            {/* Code chip — tap to copy */}
             <button onClick={copyCode}
               style={{ background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', borderRadius: 10, padding: '8px 12px', color: C.bg, cursor: 'pointer', flexShrink: 0, textAlign: 'center' }}>
               <div className="mono" style={{ fontSize: 20, letterSpacing: 4, fontWeight: 600 }}>{crewTrip.id}</div>
               <div className="mono" style={{ fontSize: 9, opacity: 0.55, letterSpacing: 1, textTransform: 'uppercase', marginTop: 2 }}>tap to copy</div>
             </button>
           </div>
-          {/* Stats row */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 14 }}>
             {[['Items', totalItems], ['Claimed', claimedCount], ['Mine', myCount]].map(([label, val]) => (
               <div key={label} style={{ background: 'rgba(255,255,255,0.06)', borderRadius: 10, padding: '10px 12px' }}>
@@ -4235,15 +4247,24 @@ function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
         </div>
       </section>
 
-      {/* Who I am + action bar */}
+      {/* Invite crew — prominent rust button */}
+      <button onClick={shareTrip} className="lift"
+        style={{
+          width: '100%', padding: 13, marginBottom: 10,
+          background: C.rust, color: C.bg, border: 'none', borderRadius: 12,
+          fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15,
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, cursor: 'pointer',
+        }}>
+        <Users size={16}/> Invite crew — share trip code
+      </button>
+
+      {/* You + refresh + leave */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 14, alignItems: 'center' }}>
         <div style={{ flex: 1, background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 10, padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
           <UserCheck size={14} color={C.muted}/>
           <span className="mono" style={{ fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', color: C.muted }}>You:</span>
           <span className="fr" style={{ fontSize: 15, fontWeight: 600, color: C.ink }}>{myName}</span>
-          {syncing && (
-            <span className="mono" style={{ fontSize: 10, color: C.muted, marginLeft: 'auto' }}>syncing…</span>
-          )}
+          {syncing && <span className="mono" style={{ fontSize: 10, color: C.muted, marginLeft: 'auto' }}>syncing…</span>}
         </div>
         <button onClick={() => fetchClaims(crewTrip.id)} title="Refresh" className="lift"
           style={{ padding: '8px 10px', background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 10, cursor: 'pointer', color: C.muted, display: 'grid', placeItems: 'center' }}>
@@ -4266,29 +4287,44 @@ function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
         </div>
       )}
 
-      {/* Items grouped by category */}
+      {/* Categories — collapsible with colour-coded icons matching Pack tab */}
       {groupedItems.map(group => {
         const t = tintFor(group.tint);
+        const Icon = group.icon;
+        const isOpen = crewOpen[group.title] !== false;
+        const groupClaimed = group.items.filter(i => i.claimer).length;
+        const pct = group.items.length ? Math.round((groupClaimed / group.items.length) * 100) : 0;
+
         return (
           <section key={group.title} style={{ background: C.paper, border: `1px solid ${C.rule}`, borderRadius: 14, marginBottom: 10, overflow: 'hidden' }}>
-            {/* Category header */}
-            <div style={{ padding: '10px 14px', borderBottom: `1px solid ${C.rule}`, display: 'flex', alignItems: 'center', gap: 10 }}>
-              <div style={{ width: 8, height: 8, borderRadius: '50%', background: t.icon, flexShrink: 0 }}/>
-              <span className="fr" style={{ fontWeight: 600, fontSize: 14, color: C.ink, flex: 1 }}>{group.title}</span>
-              <span className="mono" style={{ fontSize: 9, letterSpacing: 1, color: C.muted }}>
-                {group.items.filter(i => i.claimer).length}/{group.items.length}
-              </span>
+
+            <button onClick={() => setCrewOpen(prev => ({ ...prev, [group.title]: !isOpen }))}
+              style={{ width: '100%', textAlign: 'left', background: 'transparent', border: 'none', padding: 14, display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}>
+              <div style={{ width: 38, height: 38, borderRadius: 10, background: t.bg, color: t.dark, display: 'grid', placeItems: 'center', flexShrink: 0 }}>
+                {Icon && <Icon size={18}/>}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                  <div className="fr" style={{ fontSize: 17, fontWeight: 600, lineHeight: 1.1 }}>{group.title}</div>
+                  <div className="mono" style={{ fontSize: 11, color: C.muted }}>{groupClaimed}/{group.items.length}</div>
+                </div>
+              </div>
+              <ChevronDown size={18} style={{ color: C.muted, transition: 'transform .2s ease', transform: isOpen ? 'rotate(180deg)' : 'none', flexShrink: 0 }}/>
+            </button>
+
+            <div style={{ height: 2, position: 'relative' }}>
+              <div style={{ position: 'absolute', inset: 0, background: C.paper2 }}/>
+              <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${pct}%`, background: t.fg, transition: 'width .3s ease' }}/>
             </div>
-            {/* Items */}
-            {group.items.map((item, idx) => {
-              const isMine   = item.claimer === myName;
+
+            {isOpen && group.items.map(item => {
+              const isMine    = item.claimer === myName;
               const isClaimed = !!item.claimer;
               return (
                 <div key={item.id} style={{
                   display: 'flex', alignItems: 'center', gap: 10,
-                  padding: '9px 14px',
-                  borderBottom: idx < group.items.length - 1 ? `1px solid ${C.rule}` : 'none',
-                  background: isMine ? `${C.forestLt}55` : 'transparent',
+                  padding: '9px 14px', borderTop: `1px solid ${C.rule}`,
+                  background: isMine ? t.bg : 'transparent',
                 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13.5, color: C.ink, fontWeight: isMine ? 600 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -4305,11 +4341,7 @@ function CrewView({ categories, crewTrip, setCrewTrip, flash }) {
                   {isClaimed ? (
                     <button onClick={() => isMine ? releaseClaim(item.id) : claimItem(item.id, item.name, group.title)}
                       className="lift"
-                      style={{
-                        padding: '5px 11px', borderRadius: 8, fontSize: 12.5, fontWeight: 600, cursor: 'pointer', border: 'none', flexShrink: 0,
-                        background: isMine ? C.forest : C.rustLt,
-                        color: isMine ? C.bg : C.rustDk,
-                      }}>
+                      style={{ padding: '5px 11px', borderRadius: 8, fontSize: 12.5, fontWeight: 600, cursor: 'pointer', border: 'none', flexShrink: 0, background: isMine ? t.fg : C.rustLt, color: isMine ? C.bg : C.rustDk }}>
                       {isMine ? '✓ Mine' : 'Take it'}
                     </button>
                   ) : (
