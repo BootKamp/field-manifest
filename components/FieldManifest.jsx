@@ -2937,7 +2937,136 @@ function FuelPlanner({ avgConsumption, onUseStop }) {
     URL.revokeObjectURL(url);
   };
 
-  // Build the prompt for one route
+  // ── NSW Fuel API constants ──────────────────────────────────────────
+  const NSW_API_KEY  = '1MYSRAx5yvqHUZc6VGtxix6oMA2qgfRT';
+  const NSW_AUTH     = 'Basic MU1ZU1JBeDV5dnFIVVpjNlZHdHhpeDZvTUEycWdmUlQ6Qk12V2FjdzE1RXQ4dUZHRg==';
+  const PROXIES      = [
+    'https://corsproxy.io/?',
+    'https://api.allorigins.win/raw?url=',
+  ];
+
+  // Map UI fuel type → NSW API fueltype code
+  const fuelCode = { Diesel: 'DL', '91 Unleaded': 'U91', '95 Premium': 'P95', '98 Premium': 'P98', E10: 'E10' };
+
+  // Haversine distance in km
+  function haversine(lat1, lon1, lat2, lon2) {
+    const R = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  // Geocode via Nominatim
+  async function geocode(q) {
+    if (!q) return null;
+    try {
+      const r = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q + ' Australia')}&format=json&limit=1&countrycodes=au`);
+      const d = await r.json();
+      if (d.length > 0) return { lat: parseFloat(d[0].lat), lon: parseFloat(d[0].lon), name: d[0].display_name.split(',')[0] };
+    } catch (e) {}
+    return null;
+  }
+
+  // OSRM route geometry
+  async function getRoute(fromLat, fromLon, toLat, toLon) {
+    try {
+      const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${fromLon},${fromLat};${toLon},${toLat}?overview=full&geometries=geojson`);
+      if (!r.ok) return null;
+      const d = await r.json();
+      if (d.code === 'Ok' && d.routes[0]) {
+        return { coords: d.routes[0].geometry.coordinates, distanceKm: d.routes[0].distance / 1000 };
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // Evenly spaced stops along the route
+  function makeStops(coords, intervalKm) {
+    const stops = [];
+    let dist = 0, last = 0;
+    stops.push({ lat: coords[0][1], lon: coords[0][0], d: 0 });
+    for (let i = 1; i < coords.length; i++) {
+      dist += haversine(coords[i-1][1], coords[i-1][0], coords[i][1], coords[i][0]);
+      if (dist - last >= intervalKm) {
+        stops.push({ lat: coords[i][1], lon: coords[i][0], d: dist });
+        last = dist;
+      }
+    }
+    const last_ = stops[stops.length - 1];
+    if (!last_ || last_.d < dist * 0.85) {
+      stops.push({ lat: coords[coords.length-1][1], lon: coords[coords.length-1][0], d: dist });
+    }
+    return stops;
+  }
+
+  // Try to get NSW Fuel API token via CORS proxy
+  async function getNSWToken() {
+    for (const proxy of PROXIES) {
+      try {
+        const url = proxy + encodeURIComponent('https://api.onegov.nsw.gov.au/oauth/client_credential/accesstoken?grant_type=client_credentials');
+        const r = await fetch(url, { headers: { Authorization: NSW_AUTH } });
+        if (r.ok) {
+          const d = await r.json();
+          if (d.access_token) return { token: d.access_token, proxy };
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  // Query NSW Fuel API for stations near a point
+  async function nearbyNSW(lat, lon, radiusKm, token, proxy) {
+    const code = fuelCode[fuelType] || 'DL';
+    const ts   = new Date().toLocaleString('en-AU', { timeZone: 'Australia/Sydney', hour12: true });
+    try {
+      const url = proxy + encodeURIComponent('https://api.onegov.nsw.gov.au/FuelPriceCheck/v2/fuel/prices/nearby');
+      const r   = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json; charset=utf-8',
+          apikey: NSW_API_KEY,
+          transactionid: `t${Date.now()}`,
+          requesttimestamp: ts,
+        },
+        body: JSON.stringify({
+          fueltype: code, brand: [], namedlocation: '',
+          latitude: lat.toFixed(6), longitude: lon.toFixed(6),
+          radius: radiusKm.toString(), sortby: 'price', sortascending: 'true',
+        }),
+      });
+      if (!r.ok) return [];
+      const d = await r.json();
+      if (!d.stations || !d.prices) return [];
+      const sm = {};
+      d.stations.forEach(s => sm[String(s.code)] = s);
+      return d.prices
+        .filter(p => p.fueltype === code)
+        .map(p => {
+          const s = sm[String(p.stationcode)];
+          if (!s) return null;
+          return {
+            name: s.name,
+            state: 'NSW',
+            distFromStartKm: 0,
+            lat: s.location.latitude,
+            lng: s.location.longitude,
+            pricePerL: p.price / 100,   // API returns cents, convert to $/L
+            type: 'town',
+            priceConfidence: 'live',
+            notes: `${s.brand} · ${s.address}`,
+            _distFromStop: haversine(lat, lon, s.location.latitude, s.location.longitude),
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => (a.pricePerL || 99) - (b.pricePerL || 99));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // Claude AI fallback — used when NSW API unavailable or route is outside NSW
   const buildPrompt = (s, e) => `Plan an Australian ${fuelType} fuel route from "${s}" to "${e}". Use web search to find the cheapest current prices (NSW FuelCheck, FuelWatch WA, MyFuel NT, MotorMouth, PetrolSpy, roadhouse sites).
 
 Goal: list the CHEAPEST fuel options roughly every ${intervalKm}km along the driving route — the user should be able to skim it and know exactly where to fill up.
@@ -2956,10 +3085,7 @@ Respond with ONLY this JSON, no prose or markdown:
 
 Sort stops ascending by distFromStartKm. Keep notes ≤80 chars. Keep advice to 1–2 sentences naming the cheapest fill points and any expensive ones to skip.`;
 
-  // Live search via the Anthropic API with web_search.
-  // Requires a deployed backend proxy for production — the mobile artifact
-  // sandbox blocks direct calls to api.anthropic.com.
-  const searchRoute = async (s, e) => {
+  const searchRouteClaude = async (s, e) => {
     const response = await fetch('/.netlify/functions/plan-route', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2970,29 +3096,11 @@ Sort stops ascending by distFromStartKm. Keep notes ≤80 chars. Keep advice to 
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       }),
     });
-    
     const responseText = await response.text();
-    console.log('API response status:', response.status);
-    console.log('API response body:', responseText.substring(0, 500));
-    
-    if (!response.ok) {
-      console.error('Full error response:', responseText);
-      throw new Error(`Search request failed (${response.status}): ${responseText.substring(0, 200)}`);
-    }
-    
+    if (!response.ok) throw new Error(`Search request failed (${response.status}): ${responseText.substring(0, 200)}`);
     let data;
-    try {
-      data = JSON.parse(responseText);
-    } catch (e) {
-      console.error('JSON parse error:', e);
-      console.error('Response text:', responseText);
-      throw new Error(`API returned invalid JSON: ${e.message}`);
-    }
-    
-    const text = (data.content || [])
-      .filter(b => b && b.type === 'text')
-      .map(b => b.text)
-      .join('\n');
+    try { data = JSON.parse(responseText); } catch (e) { throw new Error(`API returned invalid JSON: ${e.message}`); }
+    const text = (data.content || []).filter(b => b && b.type === 'text').map(b => b.text).join('\n');
     if (!text) throw new Error('Empty response — the search returned no text content.');
     const parsed = extractJson(text);
     if (!Array.isArray(parsed.stops)) throw new Error('Response missing stops array.');
@@ -3004,6 +3112,71 @@ Sort stops ascending by distFromStartKm. Keep notes ≤80 chars. Keep advice to 
       lng: stop.lng == null || isNaN(Number(stop.lng)) ? null : Number(stop.lng),
     })).sort((a, b) => a.distFromStartKm - b.distFromStartKm);
     return parsed;
+  };
+
+  // Main search — tries NSW Fuel API first, falls back to Claude AI
+  const searchRoute = async (s, e) => {
+    // Step 1: geocode both ends
+    setLoadingMsg('Finding route…');
+    const [fromPt, toPt] = await Promise.all([geocode(s), geocode(e)]);
+    if (!fromPt || !toPt) throw new Error('Could not find one or both locations. Try adding the state (e.g. "Dubbo NSW").');
+
+    // Step 2: get driving route from OSRM
+    setLoadingMsg('Plotting the route…');
+    const route = await getRoute(fromPt.lat, fromPt.lon, toPt.lat, toPt.lon);
+    const totalDistanceKm = route ? Math.round(route.distanceKm) : Math.round(haversine(fromPt.lat, fromPt.lon, toPt.lat, toPt.lon));
+
+    // Step 3: try NSW Fuel API (live prices)
+    setLoadingMsg('Checking current fuel prices…');
+    const nswAuth = await getNSWToken();
+
+    if (nswAuth) {
+      // NSW API available — query each stop
+      const coords   = route ? route.coords : [[fromPt.lon, fromPt.lat], [toPt.lon, toPt.lat]];
+      const stopPts  = makeStops(coords, intervalKm);
+      const allStops = [];
+
+      for (let i = 0; i < stopPts.length; i++) {
+        setLoadingMsg(`Stop ${i + 1} of ${stopPts.length}: searching…`);
+        const sp       = stopPts[i];
+        const stations = await nearbyNSW(sp.lat, sp.lon, 15, nswAuth.token, nswAuth.proxy);
+        if (stations.length > 0) {
+          const best = stations[0];
+          allStops.push({
+            ...best,
+            distFromStartKm: Math.round(sp.d),
+          });
+        } else {
+          // No station found at this stop — skip it silently
+        }
+      }
+
+      if (allStops.length === 0) {
+        // NSW API connected but no results — fall through to Claude
+      } else {
+        // Ensure start and end are included
+        if (allStops[0]?.distFromStartKm > 5) {
+          allStops.unshift({ name: s, state: '', distFromStartKm: 0, lat: fromPt.lat, lng: fromPt.lon, pricePerL: null, type: 'town', priceConfidence: 'estimated', notes: 'Starting point' });
+        }
+        allStops.push({ name: e, state: '', distFromStartKm: totalDistanceKm, lat: toPt.lat, lng: toPt.lon, pricePerL: null, type: 'town', priceConfidence: 'estimated', notes: 'Destination' });
+
+        return {
+          route: `${s} → ${e}`,
+          totalDistanceKm,
+          fuelType,
+          stops: allStops,
+          advice: `Live prices from NSW Fuel API. ${allStops.filter(st => st.pricePerL).length} stations with current prices found along your route.`,
+          _source: 'nsw-api',
+        };
+      }
+    }
+
+    // Step 4: Fall back to Claude AI with web search
+    setLoadingMsg('Searching roadhouses and stations…');
+    const claudeResult = await searchRouteClaude(s, e);
+    claudeResult._source = 'claude-ai';
+    if (!claudeResult.totalDistanceKm && totalDistanceKm) claudeResult.totalDistanceKm = totalDistanceKm;
+    return claudeResult;
   };
 
   const handleQuickRoute = (r) => {
@@ -3061,7 +3234,7 @@ Sort stops ascending by distFromStartKm. Keep notes ≤80 chars. Keep advice to 
               padding: '2px 6px', borderRadius: 4, fontWeight: 600,
               display: 'inline-flex', alignItems: 'center', gap: 4,
             }}>
-              <Sparkles size={10}/> AI + live web
+              <Sparkles size={10}/> Live prices
             </span>
           </div>
           <p className="fr" style={{ fontStyle: 'italic', fontSize: 13.5, color: C.muted, margin: '4px 0 0', lineHeight: 1.35 }}>
